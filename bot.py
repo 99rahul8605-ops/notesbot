@@ -35,6 +35,7 @@ import re
 import sqlite3
 import struct
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -106,6 +107,61 @@ async def _deny_if_not_admin(event) -> bool:
     else:
         await event.respond("⛔ Ye admin-only command hai.")
     return True
+
+
+# ---------- Rate limiting (flood/spam protection) ----------
+# Ek user X second me sirf N searches kar sakta hai. Isse koi ek user
+# bot ko flood karke sabke liye slow/down na kar de.
+RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "5"))    # max searches
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "10"))  # ...per N sec
+_rate_buckets: dict = defaultdict(deque)
+_rate_last_warned: dict = {}
+
+# File-send (note tap karke actual file/photo bhejna) ke liye ALAG, thoda
+# strict limit — kyunki ye search se zyada heavy operation hai (bandwidth +
+# Telegram API calls). Isse "same file baar-baar mangna" wala spam rukta hai.
+FILE_RATE_LIMIT_COUNT = int(os.environ.get("FILE_RATE_LIMIT_COUNT", "5"))
+FILE_RATE_LIMIT_WINDOW = int(os.environ.get("FILE_RATE_LIMIT_WINDOW", "20"))
+_file_rate_buckets: dict = defaultdict(deque)
+
+
+def _check_limit(buckets: dict, user_id: int, count: int, window: int) -> bool:
+    """True = allowed. False = is user abhi rate-limited hai."""
+    if user_id in ADMIN_IDS:
+        return True
+    now = time.time()
+    bucket = buckets[user_id]
+    while bucket and now - bucket[0] > window:
+        bucket.popleft()
+    if len(bucket) >= count:
+        return False
+    bucket.append(now)
+    return True
+
+
+def _check_rate_limit(user_id: int) -> bool:
+    return _check_limit(_rate_buckets, user_id, RATE_LIMIT_COUNT, RATE_LIMIT_WINDOW)
+
+
+def _check_file_rate_limit(user_id: int) -> bool:
+    return _check_limit(_file_rate_buckets, user_id, FILE_RATE_LIMIT_COUNT, FILE_RATE_LIMIT_WINDOW)
+
+
+async def _rate_limit_notice(respond_fn, user_id: int):
+    """Warning sirf kabhi kabhi bhejo (har blocked request pe nahi),
+    warna warning khud hi spam ban jayegi."""
+    now = time.time()
+    last = _rate_last_warned.get(user_id, 0)
+    if now - last < RATE_LIMIT_WINDOW:
+        return
+    _rate_last_warned[user_id] = now
+    try:
+        await respond_fn(
+            f"⏳ Thoda slow down! {RATE_LIMIT_WINDOW} second me max "
+            f"{RATE_LIMIT_COUNT} searches allowed hain. Thodi der baad try karo."
+        )
+    except Exception:
+        pass
 
 
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "5"))
@@ -568,6 +624,13 @@ async def reply_search(chat, query: str):
 
 @bot.on(events.CallbackQuery(pattern=r"^pg:(\d+)$"))
 async def on_page(event):
+    if not _check_rate_limit(event.sender_id):
+        await event.answer(
+            f"⏳ Thoda slow down, {RATE_LIMIT_WINDOW}s me max "
+            f"{RATE_LIMIT_COUNT} taps allowed hain.",
+            alert=True,
+        )
+        return
     offset = int(event.pattern_match.group(1))
     msg = await event.get_message()
     query = _query_from_message_text(msg.text if msg else None)
@@ -592,6 +655,13 @@ async def on_page(event):
 
 @bot.on(events.CallbackQuery(pattern=r"^note:(-?\d+):(\d+)$"))
 async def on_note_pick(event):
+    if not _check_file_rate_limit(event.sender_id):
+        await event.answer(
+            f"⏳ Thoda slow down, {FILE_RATE_LIMIT_WINDOW}s me max "
+            f"{FILE_RATE_LIMIT_COUNT} files allowed hain.",
+            alert=True,
+        )
+        return
     cid = int(event.pattern_match.group(1))
     mid = int(event.pattern_match.group(2))
     r = db.execute(
@@ -668,6 +738,9 @@ async def on_find(event):
     # lekin private chat kabhi block nahi hogi).
     if GROUP_ID and not event.is_private and event.chat_id != int(GROUP_ID):
         return
+    if not _check_rate_limit(event.sender_id):
+        await _rate_limit_notice(event.respond, event.sender_id)
+        return
     query = event.pattern_match.group(2).strip()
     async with bot.action(event.chat_id, "typing"):
         await reply_search(event.chat_id, query)
@@ -682,6 +755,9 @@ async def on_dm_plain_text(event):
     ho jaye — groups me ye kaam nahi karta (wahan spam ho jayega),
     isliye sirf private chat tak limited hai. `not e.out` zaroori hai
     warna bot apne hi bheje results ko naye query samajh ke loop kar dega."""
+    if not _check_rate_limit(event.sender_id):
+        await _rate_limit_notice(event.respond, event.sender_id)
+        return
     query = event.raw_text.strip()
     async with bot.action(event.chat_id, "typing"):
         await reply_search(event.chat_id, query)
@@ -711,6 +787,8 @@ async def on_debug(event):
     lines.append(f"• GROUP_ID filter: {GROUP_ID if GROUP_ID else 'off (sab groups me chalta hai)'} (DM me bot hamesha kaam karta hai)")
     lines.append(f"• ADMIN_IDS: {len(ADMIN_IDS)} configured" if ADMIN_IDS
                  else "• ADMIN_IDS: ❌ khali hai — admin commands abhi kisi ke liye kaam nahi karenge")
+    lines.append(f"• Rate limit: {RATE_LIMIT_COUNT} searches / {RATE_LIMIT_WINDOW}s per user (admins exempt)")
+    lines.append(f"• File rate limit: {FILE_RATE_LIMIT_COUNT} files / {FILE_RATE_LIMIT_WINDOW}s per user (admins exempt)")
     if CHANNEL:
         cid = await channel_id()
         if cid:
