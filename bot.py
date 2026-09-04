@@ -1,8 +1,9 @@
 """
-Telegram Notes Search Bot
-=========================
-Ek channel se notes (messages/files) ko index karta hai aur group me
-accurate search karke deta hai.
+Telegram Notes Search Bot (CA Aspirants ke liye)
+=================================================
+Ek channel se CA study notes (PDFs/images/messages) ko index karta hai
+aur group me accurate search karke deta hai — e.g. "costing marginal
+costing", "audit ch 3", "ind as 116" jaisi queries se.
 
 Kaise kaam karta hai:
 1. Bot ko notes channel me ADMIN banao  -> channel ka har naya post
@@ -40,6 +41,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events, utils
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
 
@@ -145,6 +147,37 @@ def _check_rate_limit(user_id: int) -> bool:
 
 def _check_file_rate_limit(user_id: int) -> bool:
     return _check_limit(_file_rate_buckets, user_id, FILE_RATE_LIMIT_COUNT, FILE_RATE_LIMIT_WINDOW)
+
+
+async def _track_user(event, kind: str):
+    """Har allowed search/file-request pe user ki activity record karo
+    (/stats me dikhane ke liye). kind = 'search' ya 'file'."""
+    uid = event.sender_id
+    if uid is None:
+        return
+    now = int(time.time())
+    username = None
+    try:
+        sender = await event.get_sender()
+        username = getattr(sender, "username", None) or getattr(sender, "first_name", None)
+    except Exception:
+        pass
+    col = "search_count" if kind == "search" else "file_count"
+    row = db.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
+    if row:
+        db.execute(
+            f"UPDATE users SET last_seen=?, username=COALESCE(?, username), "
+            f"{col} = {col} + 1 WHERE user_id=?",
+            (now, username, uid),
+        )
+    else:
+        db.execute(
+            "INSERT INTO users (user_id, username, first_seen, last_seen, "
+            "search_count, file_count) VALUES (?,?,?,?,?,?)",
+            (uid, username, now, now, 1 if kind == "search" else 0,
+             1 if kind == "file" else 0),
+        )
+    db.commit()
 
 
 async def _rate_limit_notice(respond_fn, user_id: int):
@@ -265,6 +298,20 @@ db.executescript(
 db.execute(
     "CREATE VIRTUAL TABLE IF NOT EXISTS notes_vocab USING fts5vocab(notes_fts, 'row')"
 )
+# User activity tracking (/stats me dikhane ke liye) — same SQLite DB me,
+# koi alag DB/service (Mongo waghera) ki zaroorat nahi.
+db.execute(
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id       INTEGER PRIMARY KEY,
+        username      TEXT,
+        first_seen    INTEGER,
+        last_seen     INTEGER,
+        search_count  INTEGER DEFAULT 0,
+        file_count    INTEGER DEFAULT 0
+    )
+    """
+)
 # Purani DB migration: content_hash column + unique index (dedupe ke liye)
 _cols = [r[1] for r in db.execute("PRAGMA table_info(notes)")]
 if "content_hash" not in _cols:
@@ -365,8 +412,10 @@ def add_note(message, text: str, channel_id: int) -> bool:
 # ---------------------------------------------------------------- search
 
 STOPWORDS = {"the", "a", "an", "of", "for", "and", "or", "in", "on", "to",
-             "ka", "ki", "ke", "hai", "me", "se", "ka", "kya", "pdf",
-             "notes", "note", "chapter", "ch"}
+             "ka", "ki", "ke", "hai", "me", "se", "kya", "pdf",
+             "notes", "note", "chapter", "ch",
+             # CA students aksar aise filler words ke saath maangte hain
+             "please", "send", "share", "download", "link", "bhejo", "de", "do"}
 
 
 def tokens(q: str):
@@ -427,7 +476,7 @@ def _page_buttons(query: str, results, offset: int):
 
 def _closest_terms(token: str, limit: int = 3, min_ratio: float = 0.72):
     """Index ke vocab me se token ke closest-spelling words dhoondo —
-    ye asli typo-correction hai (jaise 'chemstry' -> 'chemistry'),
+    ye asli typo-correction hai (jaise 'acounting' -> 'accounting'),
     isse alag hai FTS prefix match jo sirf shuru se match karta hai."""
     tl = len(token)
     if tl < 3:
@@ -612,7 +661,7 @@ async def reply_search(chat, query: str):
                 "• Spelling ek baar check kar lo\n"
                 "• Poora sentence mat likho — sirf 1-2 **keyword** likho "
                 "(jaise subject ka naam ya file ka koi khaas shabd)\n"
-                "• Chhota/short word try karo (jaise \"semiconductor\" ki jagah \"semi\")\n\n"
+                "• Chhota/short word try karo (jaise \"depreciation\" ki jagah \"deprec\")\n\n"
                 f"Tip: `/debug` se index ka status dekh sakte ho.",
                 link_preview=False,
             )
@@ -671,6 +720,7 @@ async def on_note_pick(event):
         await event.answer("Ye note index me nahi mila (purana result hai, dobara search karo)", alert=True)
         return
     await event.answer()
+    await _track_user(event, "file")
     await send_result(event.chat_id, Result(r, 0.0))
 
 
@@ -715,7 +765,7 @@ async def on_start(event):
     text = (
         "👋 **Notes Search Bot**\n\n"
         "Notes dhoondhne ke liye:\n"
-        "• `/find <topic>` — e.g. `/find physics ch 5 semiconductors`\n"
+        "• `/find <topic>` — e.g. `/find costing ch 5 marginal costing`\n"
         "• Inline: `@yourbotname <topic>` (kisi bhi chat me)"
     )
     if event.is_private:
@@ -723,10 +773,12 @@ async def on_start(event):
     if is_admin(event):
         text += (
             "\n\n**Admin commands:**\n"
-            "• `/stats` — index me kitne notes hain\n"
+            "• `/stats` — index me kitne notes hain + user activity\n"
             "• `/debug` — setup ka poora status (agar search kuch na de)\n"
             "• `/reindex` — channel ka missing history index karo "
-            "(USER_SESSION chahiye)"
+            "(USER_SESSION chahiye)\n"
+            "• `/broadcast [--g] [--f] [--p]` — kisi message ko reply karke "
+            "sabko bhejo (details ke liye bina reply ke `/broadcast` chalao)"
         )
     await event.respond(text, link_preview=False)
 
@@ -742,6 +794,7 @@ async def on_find(event):
         await _rate_limit_notice(event.respond, event.sender_id)
         return
     query = event.pattern_match.group(2).strip()
+    await _track_user(event, "search")
     async with bot.action(event.chat_id, "typing"):
         await reply_search(event.chat_id, query)
 
@@ -759,6 +812,7 @@ async def on_dm_plain_text(event):
         await _rate_limit_notice(event.respond, event.sender_id)
         return
     query = event.raw_text.strip()
+    await _track_user(event, "search")
     async with bot.action(event.chat_id, "typing"):
         await reply_search(event.chat_id, query)
 
@@ -768,7 +822,34 @@ async def on_stats(event):
     if await _deny_if_not_admin(event):
         return
     n = db.execute("SELECT COUNT(*) c FROM notes").fetchone()["c"]
-    await event.respond(f"📊 Index me **{n}** notes hain.", link_preview=False)
+    total_users = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    total_searches = db.execute(
+        "SELECT COALESCE(SUM(search_count),0) c FROM users").fetchone()["c"]
+    total_files = db.execute(
+        "SELECT COALESCE(SUM(file_count),0) c FROM users").fetchone()["c"]
+
+    lines = [
+        "📊 **Bot Stats**",
+        f"• Notes indexed: **{n}**",
+        f"• Unique users: **{total_users}**",
+        f"• Total searches: **{total_searches}**",
+        f"• Total file downloads: **{total_files}**",
+    ]
+
+    top = db.execute(
+        "SELECT user_id, username, search_count, file_count FROM users "
+        "ORDER BY (search_count + file_count) DESC LIMIT 5"
+    ).fetchall()
+    if top:
+        lines.append("\n**Top active users:**")
+        for i, u in enumerate(top, 1):
+            name = f"@{u['username']}" if u["username"] else f"`{u['user_id']}`"
+            lines.append(
+                f"{i}. {name} — {u['search_count']} searches, "
+                f"{u['file_count']} files"
+            )
+
+    await event.respond("\n".join(lines), link_preview=False)
 
 
 @bot.on(events.NewMessage(pattern=r"^/debug(@\w+)?"))
@@ -829,6 +910,98 @@ async def on_reindex(event):
         await event.respond("❌ CHANNEL resolve nahi hua user session se, .env check karo.")
         return
     await event.respond(f"✅ Done! {count} notes index ho gaye ({scanned} messages scan hue).")
+
+
+@bot.on(events.NewMessage(pattern=r"^/broadcast(@\w+)?(\s+.*)?$"))
+async def on_broadcast(event):
+    """Admin kisi bhi message (text/sticker/photo/document/poll — kuch bhi)
+    ko REPLY karke `/broadcast [flags]` chalaye, wahi message as-is
+    (formatting/media sab intact) sabko bhej diya jaata hai.
+
+    Default: sabhi individual USERS ko DM me bhejta hai.
+
+    Flags:
+      --g   GROUP ko bhi bhejo, users ke saath (dono — DM + group)
+      --f   FORWARD karo ("Forwarded from" tag ke saath); default = clean copy
+      --p   Bhejne ke baad us chat me PIN bhi kar do
+    """
+    if await _deny_if_not_admin(event):
+        return
+
+    reply = await event.get_reply_message()
+    if not reply:
+        await event.respond(
+            "⚠️ Jis message ko broadcast karna hai, usko **reply** karke "
+            "`/broadcast` bhejo.\n\n"
+            "Default: sabhi individual **users** ko DM me bhejega.\n\n"
+            "**Flags:**\n"
+            "• `--g` — GROUP ko bhi bhejo (users ke saath, dono)\n"
+            "• `--f` — forward karo (\"Forwarded from\" tag ke saath), "
+            "default me clean copy jaata hai\n"
+            "• `--p` — bhejne ke baad us chat me pin bhi kar do\n\n"
+            "Example: `/broadcast --g --p`"
+        )
+        return
+
+    args = (event.pattern_match.group(2) or "").split()
+    use_group_too = "--g" in args
+    use_forward = "--f" in args
+    use_pin = "--p" in args
+
+    targets = [r["user_id"] for r in db.execute("SELECT user_id FROM users").fetchall()]
+    group_warning = ""
+    if use_group_too:
+        if GROUP_ID:
+            targets.append(int(GROUP_ID))
+        else:
+            group_warning = (
+                "\n⚠️ `--g` diya tha lekin `.env` me `GROUP_ID` set nahi hai "
+                "— isliye sirf users ko bheja gaya."
+            )
+    if not targets:
+        await event.respond(
+            "⚠️ Abhi tak koi user tracked nahi hai (koi bhi user ne "
+            "search/find use nahi kiya, isliye DM list khali hai)."
+            + group_warning
+        )
+        return
+
+    status = await event.respond(f"📢 Broadcast shuru... ({len(targets)} recipients){group_warning}")
+    sent, failed = 0, 0
+    for i, chat_id in enumerate(targets, 1):
+        for attempt in range(2):  # ek retry FloodWait ke baad
+            try:
+                if use_forward:
+                    sent_msg = await bot.forward_messages(chat_id, reply)
+                else:
+                    sent_msg = await bot.send_message(chat_id, reply)
+                if use_pin:
+                    m = sent_msg[0] if isinstance(sent_msg, list) else sent_msg
+                    try:
+                        await bot.pin_message(chat_id, m, notify=False)
+                    except Exception:
+                        pass  # pin fail ho (permission waghera) to bhi msg to gaya
+                sent += 1
+                break
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+                continue
+            except Exception:
+                failed += 1
+                break
+        await asyncio.sleep(0.05)  # thoda gap, Telegram flood limits se bachne ke liye
+        if i % 25 == 0:
+            try:
+                await status.edit(f"📢 Broadcast chal raha hai... {i}/{len(targets)} "
+                                   f"({sent} sent, {failed} failed)")
+            except Exception:
+                pass
+
+    await status.edit(
+        f"✅ Broadcast complete: **{sent}** bheja gaya, **{failed}** fail hua "
+        f"(total {len(targets)} recipients)."
+        + group_warning
+    )
 
 
 def no_session_msg():
