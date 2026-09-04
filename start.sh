@@ -90,20 +90,11 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-# ---------- 2) Python virtual environment ----------
-if [ ! -d "venv" ]; then
-    echo "📦 Pehli baar chal raha hai — virtual environment bana raha hoon..."
-    python3 -m venv venv
-fi
-# shellcheck disable=SC1091
-source venv/bin/activate
-
-# ---------- 3) Dependencies install/update ----------
+# ---------- 2) Dependencies install/update ----------
 _pip_install() {
     # Pehle normal install try karo. Kuch systems (newer Debian/Ubuntu,
     # PEP 668 "externally-managed-environment") isse block kar dete hain —
-    # tab --break-system-packages ke saath retry karo. venv ke andar ye
-    # generally safe hai (system Python ko touch nahi karta).
+    # tab --break-system-packages ke saath retry karo.
     if ! pip install --quiet "$@" 2>/tmp/pip_err.log; then
         if grep -qi "externally-managed-environment" /tmp/pip_err.log; then
             echo "ℹ️ System pip ne block kiya (externally-managed-environment) — "
