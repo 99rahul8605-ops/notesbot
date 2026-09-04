@@ -15,10 +15,15 @@ Kaise kaam karta hai:
    backfill hota hai (bots channel history read nahi kar sakte).
    Iske liye `python make_session.py` chala kar SESSION_STRING banao
    aur .env me daalo. (Optional - naye posts to bot khud index karta hai.)
-4. Admin commands (`/stats`, `/debug`, `/reindex`) sirf tumhare liye
-   kaam karein iske liye `.env` me `ADMIN_IDS=<tumhari_telegram_user_id>`
-   set karo (apni ID @userinfobot se pata karo). Comma se multiple
-   admins bhi daal sakte ho.
+4. Admin commands (`/stats`, `/debug`, `/reindex`, `/broadcast`) sirf
+   tumhare liye kaam karein iske liye `.env` me
+   `ADMIN_IDS=<tumhari_telegram_user_id>` set karo (apni ID @userinfobot
+   se pata karo). Comma se multiple admins bhi daal sakte ho.
+5. User activity (/stats, /broadcast) SQLite me store hoti hai by
+   default — koi extra setup nahi chahiye. Agar tumhare paas MongoDB hai
+   (jaise multi-instance ya shared-dashboard setup ke liye), `.env` me
+   `MONGO_URI=mongodb+srv://...` daal do — bot automatically Mongo
+   (async `motor` driver) use karne lagega. `pip install motor` chalao.
 
 Search accuracy:
 - SQLite FTS5 full-text index (token + prefix matching)
@@ -44,6 +49,11 @@ from telethon import Button, TelegramClient, events, utils
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
+
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient
+except ImportError:
+    AsyncIOMotorClient = None
 
 load_dotenv()
 
@@ -89,6 +99,21 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x
 }
+
+# User activity tracking (/stats, /broadcast) ke liye storage backend.
+# Default SQLite hai (same DB file, koi extra setup nahi). Agar `.env` me
+# MONGO_URI daaloge, to Mongo (motor — async driver) use hoga — ye
+# multi-instance/shared setups ke liye better hai (SQLite file ek jagah
+# locked rehti hai, Mongo network se sab instances share kar sakte hain).
+MONGO_URI = os.environ.get("MONGO_URI", "")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "notes_bot")
+mongo_users = None
+if MONGO_URI:
+    if AsyncIOMotorClient is None:
+        print("⚠️ MONGO_URI set hai lekin 'motor' package install nahi hai. "
+              "`pip install motor` karo. Filhaal SQLite fallback use ho raha hai.")
+    else:
+        mongo_users = AsyncIOMotorClient(MONGO_URI)[MONGO_DB_NAME]["users"]
 
 
 def is_admin(event) -> bool:
@@ -151,7 +176,8 @@ def _check_file_rate_limit(user_id: int) -> bool:
 
 async def _track_user(event, kind: str):
     """Har allowed search/file-request pe user ki activity record karo
-    (/stats me dikhane ke liye). kind = 'search' ya 'file'."""
+    (/stats me dikhane ke liye). kind = 'search' ya 'file'.
+    Backend: Mongo (agar MONGO_URI set hai) warna SQLite fallback."""
     uid = event.sender_id
     if uid is None:
         return
@@ -163,6 +189,23 @@ async def _track_user(event, kind: str):
     except Exception:
         pass
     col = "search_count" if kind == "search" else "file_count"
+    other_col = "file_count" if kind == "search" else "search_count"
+
+    if mongo_users is not None:
+        set_fields = {"last_seen": now}
+        if username:
+            set_fields["username"] = username
+        await mongo_users.update_one(
+            {"_id": uid},
+            {
+                "$set": set_fields,
+                "$setOnInsert": {"first_seen": now, other_col: 0},
+                "$inc": {col: 1},
+            },
+            upsert=True,
+        )
+        return
+
     row = db.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
     if row:
         db.execute(
@@ -822,11 +865,40 @@ async def on_stats(event):
     if await _deny_if_not_admin(event):
         return
     n = db.execute("SELECT COUNT(*) c FROM notes").fetchone()["c"]
-    total_users = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    total_searches = db.execute(
-        "SELECT COALESCE(SUM(search_count),0) c FROM users").fetchone()["c"]
-    total_files = db.execute(
-        "SELECT COALESCE(SUM(file_count),0) c FROM users").fetchone()["c"]
+
+    if mongo_users is not None:
+        total_users = await mongo_users.count_documents({})
+        agg = await mongo_users.aggregate([
+            {"$group": {"_id": None,
+                        "searches": {"$sum": "$search_count"},
+                        "files": {"$sum": "$file_count"}}}
+        ]).to_list(length=1)
+        total_searches = agg[0]["searches"] if agg else 0
+        total_files = agg[0]["files"] if agg else 0
+        top_docs = await mongo_users.aggregate([
+            {"$addFields": {"_activity": {"$add": [
+                {"$ifNull": ["$search_count", 0]},
+                {"$ifNull": ["$file_count", 0]},
+            ]}}},
+            {"$sort": {"_activity": -1}},
+            {"$limit": 5},
+        ]).to_list(length=5)
+        top = [
+            {"user_id": d["_id"], "username": d.get("username"),
+             "search_count": d.get("search_count", 0),
+             "file_count": d.get("file_count", 0)}
+            for d in top_docs
+        ]
+    else:
+        total_users = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        total_searches = db.execute(
+            "SELECT COALESCE(SUM(search_count),0) c FROM users").fetchone()["c"]
+        total_files = db.execute(
+            "SELECT COALESCE(SUM(file_count),0) c FROM users").fetchone()["c"]
+        top = db.execute(
+            "SELECT user_id, username, search_count, file_count FROM users "
+            "ORDER BY (search_count + file_count) DESC LIMIT 5"
+        ).fetchall()
 
     lines = [
         "📊 **Bot Stats**",
@@ -834,12 +906,9 @@ async def on_stats(event):
         f"• Unique users: **{total_users}**",
         f"• Total searches: **{total_searches}**",
         f"• Total file downloads: **{total_files}**",
+        f"• User-data backend: {'MongoDB' if mongo_users is not None else 'SQLite'}",
     ]
 
-    top = db.execute(
-        "SELECT user_id, username, search_count, file_count FROM users "
-        "ORDER BY (search_count + file_count) DESC LIMIT 5"
-    ).fetchall()
     if top:
         lines.append("\n**Top active users:**")
         for i, u in enumerate(top, 1):
@@ -870,6 +939,7 @@ async def on_debug(event):
                  else "• ADMIN_IDS: ❌ khali hai — admin commands abhi kisi ke liye kaam nahi karenge")
     lines.append(f"• Rate limit: {RATE_LIMIT_COUNT} searches / {RATE_LIMIT_WINDOW}s per user (admins exempt)")
     lines.append(f"• File rate limit: {FILE_RATE_LIMIT_COUNT} files / {FILE_RATE_LIMIT_WINDOW}s per user (admins exempt)")
+    lines.append(f"• User-data backend: {'MongoDB (' + MONGO_DB_NAME + ')' if mongo_users is not None else 'SQLite (local file)'}")
     if CHANNEL:
         cid = await channel_id()
         if cid:
@@ -948,7 +1018,10 @@ async def on_broadcast(event):
     use_forward = "--f" in args
     use_pin = "--p" in args
 
-    targets = [r["user_id"] for r in db.execute("SELECT user_id FROM users").fetchall()]
+    if mongo_users is not None:
+        targets = [doc["_id"] async for doc in mongo_users.find({}, {"_id": 1})]
+    else:
+        targets = [r["user_id"] for r in db.execute("SELECT user_id FROM users").fetchall()]
     group_warning = ""
     if use_group_too:
         if GROUP_ID:
