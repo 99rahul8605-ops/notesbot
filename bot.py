@@ -43,6 +43,7 @@ import struct
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events, utils
@@ -108,12 +109,15 @@ ADMIN_IDS = {
 MONGO_URI = os.environ.get("MONGO_URI", "")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "notes_bot")
 mongo_users = None
+mongo_daily = None  # per-day distinct-user check-ins, /stats ke DAU/WAU trend ke liye
 if MONGO_URI:
     if AsyncIOMotorClient is None:
         print("⚠️ MONGO_URI set hai lekin 'motor' package install nahi hai. "
               "`pip install motor` karo. Filhaal SQLite fallback use ho raha hai.")
     else:
-        mongo_users = AsyncIOMotorClient(MONGO_URI)[MONGO_DB_NAME]["users"]
+        _mongo_db = AsyncIOMotorClient(MONGO_URI)[MONGO_DB_NAME]
+        mongo_users = _mongo_db["users"]
+        mongo_daily = _mongo_db["daily_activity"]
 
 
 def is_admin(event) -> bool:
@@ -126,13 +130,14 @@ async def _deny_if_not_admin(event) -> bool:
         return False
     if not ADMIN_IDS:
         await event.respond(
-            "⛔ Ye admin-only command hai, lekin `.env` me `ADMIN_IDS` set "
-            "nahi hai — isliye abhi koi bhi is command ko use nahi kar sakta.\n"
-            "Apni Telegram user ID @userinfobot se pata karo, phir `.env` me "
-            "`ADMIN_IDS=<tumhari_id>` daal kar bot restart karo."
+            "⛔ **Access Denied**\n"
+            "Ye admin-only command hai, lekin `.env` me `ADMIN_IDS` set "
+            "nahi hai — isliye filhaal koi bhi ise use nahi kar sakta.\n\n"
+            "Apni Telegram user ID @userinfobot se pata karke `.env` me "
+            "`ADMIN_IDS=<apni_id>` add karein, phir bot restart karein."
         )
     else:
-        await event.respond("⛔ Ye admin-only command hai.")
+        await event.respond("⛔ **Access Denied** — ye command sirf admins ke liye hai.")
     return True
 
 
@@ -174,6 +179,24 @@ def _check_file_rate_limit(user_id: int) -> bool:
     return _check_limit(_file_rate_buckets, user_id, FILE_RATE_LIMIT_COUNT, FILE_RATE_LIMIT_WINDOW)
 
 
+async def _record_daily_activity(uid: int, now: int):
+    """DAU/WAU trend ke liye: ek user ek din me sirf EK baar count ho
+    (chahe wo us din search bhi kare aur file bhi maange). SQLite path me
+    commit yahan nahi hota — _track_user ke end me ek saath ho jaata hai."""
+    day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    if mongo_daily is not None:
+        await mongo_daily.update_one(
+            {"_id": f"{uid}:{day}"},
+            {"$setOnInsert": {"user_id": uid, "day": day}},
+            upsert=True,
+        )
+    else:
+        db.execute(
+            "INSERT OR IGNORE INTO daily_activity (user_id, day) VALUES (?,?)",
+            (uid, day),
+        )
+
+
 async def _track_user(event, kind: str):
     """Har allowed search/file-request pe user ki activity record karo
     (/stats me dikhane ke liye). kind = 'search' ya 'file'.
@@ -190,6 +213,7 @@ async def _track_user(event, kind: str):
         pass
     col = "search_count" if kind == "search" else "file_count"
     other_col = "file_count" if kind == "search" else "search_count"
+    await _record_daily_activity(uid, now)
 
     if mongo_users is not None:
         set_fields = {"last_seen": now}
@@ -233,8 +257,8 @@ async def _rate_limit_notice(respond_fn, user_id: int):
     _rate_last_warned[user_id] = now
     try:
         await respond_fn(
-            f"⏳ Thoda slow down! {RATE_LIMIT_WINDOW} second me max "
-            f"{RATE_LIMIT_COUNT} searches allowed hain. Thodi der baad try karo."
+            f"⏳ **Rate limit reached** — {RATE_LIMIT_WINDOW} second me max "
+            f"{RATE_LIMIT_COUNT} searches allowed hain. Thodi der baad dobara try karein."
         )
     except Exception:
         pass
@@ -355,6 +379,19 @@ db.execute(
     )
     """
 )
+# Har user ka har-din ek check-in (/stats me Daily/Weekly Active Users
+# trend dikhane ke liye) — MongoDB backend me isi ka equivalent
+# "daily_activity" collection hai (upar dekho).
+db.execute(
+    """
+    CREATE TABLE IF NOT EXISTS daily_activity (
+        user_id INTEGER,
+        day     TEXT,
+        PRIMARY KEY (user_id, day)
+    )
+    """
+)
+db.execute("CREATE INDEX IF NOT EXISTS idx_daily_activity_day ON daily_activity(day)")
 # Purani DB migration: content_hash column + unique index (dedupe ke liye)
 _cols = [r[1] for r in db.execute("PRAGMA table_info(notes)")]
 if "content_hash" not in _cols:
@@ -514,8 +551,8 @@ def _page_buttons(query: str, results, offset: int, owner_id: int):
         if page < npages:
             pager.append(Button.inline("Next ▶", f"pg:{offset + PAGE_SIZE}:{owner_id}"))
         buttons.append(pager)
-    text = (f"🔎 \"{query}\" — {total} results (Page {page}/{npages})\n"
-            f"Tap the note you want:")
+    text = (f"🔎 **\"{query}\"** — {total} results (Page {page}/{npages})\n"
+            f"Required note par tap karein:")
     return text, buttons
 
 
@@ -688,26 +725,27 @@ async def reply_search(chat, query: str, owner_id: int):
         if total == 0:
             await bot.send_message(
                 chat,
-                "❌ Index bilkul khali hai — isliye kuch mil nahi raha.\n\n"
-                "**Setup check karo:**\n"
-                "1. Bot ko notes **channel me ADMIN** banao (tabhi naye posts "
-                "index honge).\n"
+                "❌ **Index Khali Hai**\n"
+                "Abhi tak koi notes indexed nahi hain, isliye result nahi mila.\n\n"
+                "**Setup verify karein:**\n"
+                "1. Bot ko notes **channel me admin** banayein (tabhi naye posts "
+                "index hote hain).\n"
                 "2. Purane posts ke liye `python make_session.py` chala kar "
-                "SESSION_STRING banao, `.env` me daalo, bot restart karo.\n"
-                "3. `.env` me `CHANNEL` sahi likha hai? (jaise `@my_notes_channel`)\n"
-                "4. `/debug` chala kar status dekho.",
+                "SESSION_STRING banayein aur `.env` me add karke bot restart karein.\n"
+                "3. `.env` me `CHANNEL` sahi set hai? (jaise `@my_notes_channel`)\n"
+                "4. Detailed status ke liye `/debug` chalayein.",
                 link_preview=False,
             )
         else:
             await bot.send_message(
                 chat,
-                f"❌ \"{query}\" ke liye kuch nahi mila (index me {total} notes hain).\n\n"
-                "**Try karo:**\n"
-                "• Spelling ek baar check kar lo\n"
-                "• Poora sentence mat likho — sirf 1-2 **keyword** likho "
+                f"❌ **\"{query}\"** ke liye koi result nahi mila (index me {total} notes hain).\n\n"
+                "**Try karein:**\n"
+                "• Spelling ek baar check kar lein\n"
+                "• Poora sentence na likhein — sirf 1-2 **keyword** use karein "
                 "(jaise subject ka naam ya file ka koi khaas shabd)\n"
-                "• Chhota/short word try karo (jaise \"depreciation\" ki jagah \"deprec\")\n\n"
-                f"Tip: `/debug` se index ka status dekh sakte ho.",
+                "• Chhota/short word try karein (jaise \"depreciation\" ki jagah \"deprec\")\n\n"
+                "Tip: `/debug` se index ka status check kar sakte hain.",
                 link_preview=False,
             )
         return
@@ -723,8 +761,8 @@ async def _deny_if_not_owner(event, owner_id: int) -> bool:
     if event.sender_id == owner_id or is_admin(event):
         return False
     await event.answer(
-        "⛔ Ye sirf usi ke liye hai jisne search ki thi.\n"
-        "Khud dhoondhne ke liye apna `/find <query>` bhejo.",
+        "⛔ Ye buttons sirf search karne wale user ke liye hain.\n"
+        "Khud search karne ke liye apna `/find <query>` bhejein.",
         alert=True,
     )
     return True
@@ -738,7 +776,7 @@ async def on_page(event):
         return
     if not _check_rate_limit(event.sender_id):
         await event.answer(
-            f"⏳ Thoda slow down, {RATE_LIMIT_WINDOW}s me max "
+            f"⏳ Rate limit reached — {RATE_LIMIT_WINDOW}s me max "
             f"{RATE_LIMIT_COUNT} taps allowed hain.",
             alert=True,
         )
@@ -747,15 +785,15 @@ async def on_page(event):
     query = _query_from_message_text(msg.text if msg else None)
     if query is None:
         await event.answer(
-            "⚠️ Ye message purana/corrupt hai, /find dobara chalao.",
+            "⚠️ Ye message expired/corrupt hai — `/find` dobara chalayein.",
             alert=True,
         )
         return
     results = search(query, limit=50)
     if not results:
         await event.answer(
-            "Ab is query ke liye kuch nahi mila (notes delete ho gaye honge). "
-            "/find dobara chalao.",
+            "Is query ke liye ab koi result nahi mila (notes delete ho gaye honge). "
+            "`/find` dobara chalayein.",
             alert=True,
         )
         return
@@ -773,7 +811,7 @@ async def on_note_pick(event):
         return
     if not _check_file_rate_limit(event.sender_id):
         await event.answer(
-            f"⏳ Thoda slow down, {FILE_RATE_LIMIT_WINDOW}s me max "
+            f"⏳ Rate limit reached — {FILE_RATE_LIMIT_WINDOW}s me max "
             f"{FILE_RATE_LIMIT_COUNT} files allowed hain.",
             alert=True,
         )
@@ -782,7 +820,10 @@ async def on_note_pick(event):
         "SELECT * FROM notes WHERE channel_id=? AND msg_id=?", (cid, mid)
     ).fetchone()
     if not r:
-        await event.answer("Ye note index me nahi mila (purana result hai, dobara search karo)", alert=True)
+        await event.answer(
+            "Ye note ab index me nahi hai (purana result tha) — dobara search karein.",
+            alert=True,
+        )
         return
     await event.answer()
     await _track_user(event, "file")
@@ -828,22 +869,23 @@ async def on_channel_post(event):
 @bot.on(events.NewMessage(pattern=r"^/(start|help)(@\w+)?"))
 async def on_start(event):
     text = (
-        "👋 **Notes Search Bot**\n\n"
-        "Notes dhoondhne ke liye:\n"
+        "📚 **CA Notes Search Bot**\n"
+        "Channel ke notes turant search karein aur access karein.\n\n"
+        "**Kaise use karein:**\n"
         "• `/find <topic>` — e.g. `/find costing ch 5 marginal costing`\n"
-        "• Inline: `@yourbotname <topic>` (kisi bhi chat me)"
+        "• Inline mode: `@yourbotname <topic>` (kisi bhi chat me)"
     )
     if event.is_private:
-        text += "\n• DM me seedha topic bhi type kar sakte ho, `/find` zaroori nahi"
+        text += "\n• Yahan DM me seedha topic type karein, `/find` likhna zaroori nahi"
     if is_admin(event):
         text += (
-            "\n\n**Admin commands:**\n"
-            "• `/stats` — index me kitne notes hain + user activity\n"
-            "• `/debug` — setup ka poora status (agar search kuch na de)\n"
-            "• `/reindex` — channel ka missing history index karo "
-            "(USER_SESSION chahiye)\n"
+            "\n\n**Admin Commands:**\n"
+            "• `/stats` — usage statistics aur active-user trend\n"
+            "• `/debug` — configuration status (search kaam na kare tab check karein)\n"
+            "• `/reindex` — channel ki missing history index karein "
+            "(USER_SESSION zaroori hai)\n"
             "• `/broadcast [--g] [--f] [--p]` — kisi message ko reply karke "
-            "sabko bhejo (details ke liye bina reply ke `/broadcast` chalao)"
+            "sabko bhejein (details ke liye bina reply ke `/broadcast` chalayein)"
         )
     await event.respond(text, link_preview=False)
 
@@ -880,6 +922,58 @@ async def on_dm_plain_text(event):
     await _track_user(event, "search")
     async with bot.action(event.chat_id, "typing"):
         await reply_search(event.chat_id, query, event.sender_id)
+
+
+def _last_n_days(n: int = 7):
+    """Aaj samet peeche ke n dino ki 'YYYY-MM-DD' list, oldest pehle."""
+    today = datetime.now().date()
+    return [(today - timedelta(days=i)).isoformat() for i in range(n - 1, -1, -1)]
+
+
+def _day_label(day_str: str) -> str:
+    """'2026-09-09' -> 'Tue 09' (chat me short/readable dikhane ke liye)."""
+    return datetime.strptime(day_str, "%Y-%m-%d").strftime("%a %d")
+
+
+def _bar(value: int, vmax: int, width: int = 10) -> str:
+    """Text-only horizontal bar (Telegram me image nahi bhej sakte,
+    isliye block characters se mini bar-chart banate hain)."""
+    if vmax <= 0:
+        return "░" * width
+    filled = round((value / vmax) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+async def _daily_active_counts(days: list) -> dict:
+    """days: 'YYYY-MM-DD' strings. Returns {day: distinct_active_users}."""
+    if mongo_daily is not None:
+        counts = {}
+        for d in days:
+            counts[d] = await mongo_daily.count_documents({"day": d})
+        return counts
+    placeholders = ",".join("?" * len(days))
+    rows = db.execute(
+        f"SELECT day, COUNT(DISTINCT user_id) c FROM daily_activity "
+        f"WHERE day IN ({placeholders}) GROUP BY day",
+        days,
+    ).fetchall()
+    found = {r["day"]: r["c"] for r in rows}
+    return {d: found.get(d, 0) for d in days}
+
+
+async def _distinct_active_in_range(start_day: str, end_day_exclusive: str) -> int:
+    """start_day tak (inclusive), end_day tak (exclusive) — distinct users."""
+    if mongo_daily is not None:
+        users_set = await mongo_daily.distinct(
+            "user_id", {"day": {"$gte": start_day, "$lt": end_day_exclusive}}
+        )
+        return len(users_set)
+    row = db.execute(
+        "SELECT COUNT(DISTINCT user_id) c FROM daily_activity "
+        "WHERE day>=? AND day<?",
+        (start_day, end_day_exclusive),
+    ).fetchone()
+    return row["c"]
 
 
 @bot.on(events.NewMessage(pattern=r"^/stats(@\w+)?"))
@@ -922,22 +1016,54 @@ async def on_stats(event):
             "ORDER BY (search_count + file_count) DESC LIMIT 5"
         ).fetchall()
 
+    # ---- Daily/Weekly Active Users trend (last 7 din) ----
+    days = _last_n_days(7)
+    daily_counts = await _daily_active_counts(days)
+    vmax = max(daily_counts.values()) if daily_counts else 0
+
+    today = datetime.now().date()
+    this_week_start = (today - timedelta(days=6)).isoformat()
+    next_day = (today + timedelta(days=1)).isoformat()
+    prev_week_start = (today - timedelta(days=13)).isoformat()
+
+    wau_this = await _distinct_active_in_range(this_week_start, next_day)
+    wau_prev = await _distinct_active_in_range(prev_week_start, this_week_start)
+    if wau_prev > 0:
+        change = ((wau_this - wau_prev) / wau_prev) * 100
+        if change > 0:
+            trend = f"↑ {change:.0f}% vs pichla hafta"
+        elif change < 0:
+            trend = f"↓ {abs(change):.0f}% vs pichla hafta"
+        else:
+            trend = "→ same as pichla hafta"
+    else:
+        trend = "↑ naya" if wau_this else "—"
+
     lines = [
         "📊 **Bot Stats**",
-        f"• Notes indexed: **{n}**",
-        f"• Unique users: **{total_users}**",
-        f"• Total searches: **{total_searches}**",
-        f"• Total file downloads: **{total_files}**",
-        f"• User-data backend: {'MongoDB' if mongo_users is not None else 'SQLite'}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📚 Notes indexed: **{n}**",
+        f"👥 Unique users (all-time): **{total_users}**",
+        f"🔍 Total searches: **{total_searches}**",
+        f"📁 Total file downloads: **{total_files}**",
+        f"💾 Backend: {'MongoDB' if mongo_users is not None else 'SQLite'}",
+        "",
+        "📈 **Daily Active Users** (pichle 7 din)",
     ]
+    for d in days:
+        c = daily_counts.get(d, 0)
+        lines.append(f"`{_day_label(d)}` {_bar(c, vmax)} {c}")
+    lines.append(f"\n📅 Weekly active users: **{wau_this}** ({trend})")
 
     if top:
-        lines.append("\n**Top active users:**")
+        lines.append("\n🏆 **Top active users**")
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         for i, u in enumerate(top, 1):
+            rank = medals.get(i, f"{i}.")
             name = f"@{u['username']}" if u["username"] else f"`{u['user_id']}`"
             lines.append(
-                f"{i}. {name} — {u['search_count']} searches, "
-                f"{u['file_count']} files"
+                f"{rank} {name} — 🔍{u['search_count']} searches · "
+                f"📁{u['file_count']} files"
             )
 
     await event.respond("\n".join(lines), link_preview=False)
@@ -971,14 +1097,14 @@ async def on_debug(event):
             if n_ch == 0:
                 lines.append(
                     "⚠️ Channel se abhi tak ek bhi note index nahi hua. "
-                    "Check karo: bot channel me **admin** hai? "
+                    "Verify karein: bot channel me **admin** hai? "
                     "Session string set hai? "
                     "Channel ke posts me caption/text hai?"
                 )
         else:
             lines.append("⚠️ CHANNEL resolve nahi hua — bot channel ka username/ID "
-                         "nahi dekh pa raha. Bot ko channel me add karo ya ID "
-                         "numeric (-100...) form me likho.")
+                         "nahi dekh pa raha. Bot ko channel me add karein ya ID "
+                         "numeric (-100...) form me likhein.")
     await event.respond("\n".join(lines), link_preview=False)
 
 
@@ -992,16 +1118,16 @@ async def on_reindex(event):
     me = await user.get_me() if await user.is_user_authorized() else None
     if me and getattr(me, "bot", False):
         await event.respond(
-            "⚠️ Ye session BOT ki hai — history backfill bot se nahi hota.\n"
-            "`python setup.py` chala kar apne account se user session banao."
+            "⚠️ Ye session ek bot ki hai — history backfill bot account se nahi hota.\n"
+            "`python setup.py` chala kar apne user account se session banayein."
         )
         return
-    await event.respond("🔄 Channel history index ho rahi hai... thoda time lagega.")
+    await event.respond("🔄 Channel history index ho rahi hai — thoda time lagega.")
     count, scanned = await backfill()
     if count is None:
-        await event.respond("❌ CHANNEL resolve nahi hua user session se, .env check karo.")
+        await event.respond("❌ CHANNEL resolve nahi hua user session se — `.env` check karein.")
         return
-    await event.respond(f"✅ Done! {count} notes index ho gaye ({scanned} messages scan hue).")
+    await event.respond(f"✅ **Reindex Complete** — {count} naye notes index hue ({scanned} messages scan hue).")
 
 
 @bot.on(events.NewMessage(pattern=r"^/broadcast(@\w+)?(\s+.*)?$"))
@@ -1023,14 +1149,14 @@ async def on_broadcast(event):
     reply = await event.get_reply_message()
     if not reply:
         await event.respond(
-            "⚠️ Jis message ko broadcast karna hai, usko **reply** karke "
-            "`/broadcast` bhejo.\n\n"
-            "Default: sabhi individual **users** ko DM me bhejega.\n\n"
+            "⚠️ Jo message broadcast karna hai, usko **reply** karke "
+            "`/broadcast` chalayein.\n\n"
+            "Default: sabhi individual **users** ko DM me bheja jaata hai.\n\n"
             "**Flags:**\n"
-            "• `--g` — GROUP ko bhi bhejo (users ke saath, dono)\n"
-            "• `--f` — forward karo (\"Forwarded from\" tag ke saath), "
-            "default me clean copy jaata hai\n"
-            "• `--p` — bhejne ke baad us chat me pin bhi kar do\n\n"
+            "• `--g` — group ko bhi bhejein (users ke saath dono)\n"
+            "• `--f` — forward karein (\"Forwarded from\" tag ke saath); "
+            "default me clean copy jaati hai\n"
+            "• `--p` — bhejne ke baad us chat me pin bhi kar dein\n\n"
             "Example: `/broadcast --g --p`"
         )
         return
@@ -1050,18 +1176,18 @@ async def on_broadcast(event):
             targets.append(int(GROUP_ID))
         else:
             group_warning = (
-                "\n⚠️ `--g` diya tha lekin `.env` me `GROUP_ID` set nahi hai "
+                "\n⚠️ `--g` diya gaya tha, lekin `.env` me `GROUP_ID` set nahi hai "
                 "— isliye sirf users ko bheja gaya."
             )
     if not targets:
         await event.respond(
-            "⚠️ Abhi tak koi user tracked nahi hai (koi bhi user ne "
-            "search/find use nahi kiya, isliye DM list khali hai)."
+            "⚠️ Abhi tak koi user tracked nahi hai — kisi ne bhi search/find "
+            "use nahi kiya, isliye DM list khali hai."
             + group_warning
         )
         return
 
-    status = await event.respond(f"📢 Broadcast shuru... ({len(targets)} recipients){group_warning}")
+    status = await event.respond(f"📢 **Broadcast shuru ho raha hai** — {len(targets)} recipients{group_warning}")
     sent, failed = 0, 0
     for i, chat_id in enumerate(targets, 1):
         for attempt in range(2):  # ek retry FloodWait ke baad
@@ -1087,23 +1213,23 @@ async def on_broadcast(event):
         await asyncio.sleep(0.05)  # thoda gap, Telegram flood limits se bachne ke liye
         if i % 25 == 0:
             try:
-                await status.edit(f"📢 Broadcast chal raha hai... {i}/{len(targets)} "
+                await status.edit(f"📢 Broadcast in progress — {i}/{len(targets)} "
                                    f"({sent} sent, {failed} failed)")
             except Exception:
                 pass
 
     await status.edit(
-        f"✅ Broadcast complete: **{sent}** bheja gaya, **{failed}** fail hua "
-        f"(total {len(targets)} recipients)."
+        f"✅ **Broadcast Complete**\n"
+        f"Sent: **{sent}** · Failed: **{failed}** · Total recipients: {len(targets)}"
         + group_warning
     )
 
 
 def no_session_msg():
     return (
-        "⚠️ Purana history index karne ke liye USER_SESSION chahiye.\n"
-        "README dekho: `python make_session.py` chala kar session banao "
-        "aur .env me SESSION_STRING daalo, phir bot restart karo."
+        "⚠️ Purani history index karne ke liye USER_SESSION zaroori hai.\n"
+        "README dekhein: `python make_session.py` chala kar session banayein, "
+        "`.env` me SESSION_STRING add karein, phir bot restart karein."
     )
 
 
@@ -1176,7 +1302,7 @@ async def inline_handler(event):
         await event.answer(results)
     else:
         await event.answer(
-            [builder.article("Kuch nahi mila", text="Doosre keywords try karo!")],
+            [builder.article("Koi result nahi mila", text="Doosre keywords try karein.")],
             cache_time=1,
         )
 
