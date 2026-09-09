@@ -392,6 +392,18 @@ db.execute(
     """
 )
 db.execute("CREATE INDEX IF NOT EXISTS idx_daily_activity_day ON daily_activity(day)")
+# Admin-adjustable runtime config (/settings se change hota hai) — .env
+# ki values sirf DEFAULT/startup value hain, yahan se override persist
+# hoti hai (bot restart ke baad bhi apni value yaad rehti hai).
+db.execute(
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT,
+        updated_at INTEGER
+    )
+    """
+)
 # Purani DB migration: content_hash column + unique index (dedupe ke liye)
 _cols = [r[1] for r in db.execute("PRAGMA table_info(notes)")]
 if "content_hash" not in _cols:
@@ -452,6 +464,282 @@ except sqlite3.IntegrityError:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_hash ON notes(content_hash)"
     )
     db.commit()
+
+
+# ---------------------------------------------------------------- settings catalog
+# In env-vars ko `/settings` se bot ke through hi change kar sakte hain
+# (bina .env edit kiye, bina restart kiye). Sirf "safe" tunable knobs yahan
+# hain — API_ID/API_HASH/BOT_TOKEN/SESSION_STRING/MONGO_URI/CHANNEL jaanbujh
+# kar shamil nahi hain, kyunki inhe badalne ke liye reconnect/restart chahiye
+# ya ye sensitive credentials hain jo chat me nahi bhejni chahiye.
+SETTING_DEFS = {
+    "RATE_LIMIT_COUNT": {
+        "label": "Search rate limit — count", "type": int, "min": 1, "max": 100,
+        "hint": "Ek user X second me max kitni searches kar sakta hai",
+    },
+    "RATE_LIMIT_WINDOW": {
+        "label": "Search rate limit — window (sec)", "type": int, "min": 1, "max": 3600,
+        "hint": "Upar wali limit kitne second ke window me apply hoti hai",
+    },
+    "FILE_RATE_LIMIT_COUNT": {
+        "label": "File rate limit — count", "type": int, "min": 1, "max": 100,
+        "hint": "Ek user X second me max kitni files maang sakta hai",
+    },
+    "FILE_RATE_LIMIT_WINDOW": {
+        "label": "File rate limit — window (sec)", "type": int, "min": 1, "max": 3600,
+        "hint": "Upar wali limit kitne second ke window me apply hoti hai",
+    },
+    "MAX_RESULTS": {
+        "label": "Inline results limit", "type": int, "min": 1, "max": 50,
+        "hint": "Inline mode (@botname query) me max kitne results dikhein",
+    },
+    "PAGE_SIZE": {
+        "label": "Results per page", "type": int, "min": 1, "max": 20,
+        "hint": "/find ke paginated list me ek page pe kitne notes dikhein",
+    },
+    "GROUP_ID": {
+        "label": "Search-allowed group ID", "type": "optional_str",
+        "hint": "Khali chhodo to bot sab groups me search karega. Set karne "
+                "ke liye numeric group ID (jaise -100123456789) bhejo.",
+    },
+}
+
+
+def _setting_display_value(key: str):
+    return globals().get(key)
+
+
+def _format_setting_value(key: str, value) -> str:
+    if key == "GROUP_ID":
+        return value if value else "*(khali — sab groups)*"
+    return str(value)
+
+
+def _load_persisted_settings():
+    """Startup pe DB me persisted overrides (agar hain) .env defaults ke
+    upar apply karo, taaki `/settings`/`/addadmin`/`/deladmin` se ki gayi
+    changes restart ke baad bhi yaad rahein."""
+    for row in db.execute("SELECT key, value FROM settings"):
+        key, raw = row["key"], row["value"]
+        if key == "ADMIN_IDS":
+            try:
+                globals()["ADMIN_IDS"] = {int(x) for x in raw.split(",") if x.strip()}
+            except ValueError:
+                pass
+            continue
+        spec = SETTING_DEFS.get(key)
+        if not spec:
+            continue  # purani/anjaan key, ignore
+        try:
+            globals()[key] = int(raw) if spec["type"] is int else raw
+        except (TypeError, ValueError):
+            continue
+
+
+def _save_admin_ids():
+    """ADMIN_IDS set ko settings table me persist karo (comma-separated)."""
+    db.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        ("ADMIN_IDS", ",".join(str(x) for x in sorted(ADMIN_IDS)), int(time.time())),
+    )
+    db.commit()
+
+
+def _apply_setting(key: str, raw_value: str):
+    """Naya value validate karke apply + persist karo.
+    Returns (ok: bool, message: str)."""
+    spec = SETTING_DEFS.get(key)
+    if not spec:
+        return False, f"❌ Unknown setting: `{key}`"
+
+    raw_value = raw_value.strip()
+    if spec["type"] is int:
+        try:
+            value = int(raw_value)
+        except ValueError:
+            return False, f"❌ `{key}` ke liye number chahiye (jaise `10`)."
+        if not (spec["min"] <= value <= spec["max"]):
+            return False, (
+                f"❌ `{key}` sirf {spec['min']} se {spec['max']} ke beech "
+                f"ho sakta hai."
+            )
+    elif spec["type"] == "optional_str":
+        value = "" if raw_value in ("-", "off", "none", "khali") else raw_value
+        if value:
+            try:
+                int(value)  # GROUP_ID numeric hona chahiye
+            except ValueError:
+                return False, "❌ Group ID numeric hona chahiye (jaise `-100123456789`)."
+    else:
+        value = raw_value
+
+    globals()[key] = value
+    db.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, str(value), int(time.time())),
+    )
+    db.commit()
+    return True, f"✅ `{key}` update ho gaya: **{_format_setting_value(key, value)}**"
+
+
+_load_persisted_settings()
+
+# Admin `/settings` me ek setting edit karne ke liye tap kare -> agla plain
+# text message uska naya value maana jaata hai (DM me). key = admin user_id.
+_pending_setting_edit: dict = {}
+
+
+def _settings_overview_text() -> str:
+    lines = ["⚙️ **Bot Settings**", "Neeche kisi setting ko tap karke value badlein.\n"]
+    for key, spec in SETTING_DEFS.items():
+        val = _format_setting_value(key, _setting_display_value(key))
+        lines.append(f"• **{spec['label']}** (`{key}`): {val}")
+    return "\n".join(lines)
+
+
+def _settings_buttons():
+    return [
+        [Button.inline(f"✏️ {spec['label']}", f"cfg:{key}")]
+        for key, spec in SETTING_DEFS.items()
+    ]
+
+
+@bot.on(events.NewMessage(pattern=r"^/settings(@\w+)?"))
+async def on_settings(event):
+    if await _deny_if_not_admin(event):
+        return
+    if not event.is_private:
+        await event.respond("⚙️ Settings sirf DM me admin ke liye available hain — bot ko DM karein.")
+        return
+    await event.respond(_settings_overview_text(), buttons=_settings_buttons(), link_preview=False)
+
+
+@bot.on(events.CallbackQuery(pattern=r"^cfg:(\w+)$"))
+async def on_settings_pick(event):
+    if not is_admin(event):
+        await event.answer("⛔ Ye admin-only hai.", alert=True)
+        return
+    key = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) \
+        else event.pattern_match.group(1)
+    spec = SETTING_DEFS.get(key)
+    if not spec:
+        await event.answer("❌ Unknown setting.", alert=True)
+        return
+    _pending_setting_edit[event.sender_id] = key
+    current = _format_setting_value(key, _setting_display_value(key))
+    await event.answer()
+    await event.respond(
+        f"✏️ **{spec['label']}** (`{key}`)\n"
+        f"Current value: **{current}**\n"
+        f"{spec['hint']}\n\n"
+        f"Naya value reply me bhejein (ya /cancel likhein):"
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/cancel(@\w+)?"))
+async def on_settings_cancel(event):
+    if event.is_private and _pending_setting_edit.pop(event.sender_id, None):
+        await event.respond("Cancelled — koi change nahi hui.")
+
+
+@bot.on(events.NewMessage(pattern=r"^/setconfig(@\w+)?(\s+.*)?$"))
+async def on_setconfig(event):
+    """Power-user shortcut: `/settings` ke tap-and-reply flow ke bina,
+    ek line me directly value set karo. Example: `/setconfig MAX_RESULTS 8`"""
+    if await _deny_if_not_admin(event):
+        return
+    args = (event.pattern_match.group(2) or "").strip().split(maxsplit=1)
+    if len(args) != 2:
+        keys = ", ".join(f"`{k}`" for k in SETTING_DEFS)
+        await event.respond(
+            "Usage: `/setconfig <KEY> <VALUE>`\n\n"
+            f"Available keys: {keys}\n\n"
+            "Ya `/settings` chalayein tap-and-edit ke liye."
+        )
+        return
+    key, value = args[0].upper(), args[1]
+    _, msg = _apply_setting(key, value)
+    await event.respond(msg)
+
+
+async def _resolve_target_id(event, arg: str):
+    """Explicit numeric ID diya ho to wahi use karo, warna reply kiye gaye
+    message ke sender ko target maano. None = na argument, na reply."""
+    if arg:
+        try:
+            return int(arg.split()[0])
+        except ValueError:
+            return None
+    reply = await event.get_reply_message()
+    if reply and reply.sender_id:
+        return reply.sender_id
+    return None
+
+
+@bot.on(events.NewMessage(pattern=r"^/addadmin(@\w+)?(\s+.*)?$"))
+async def on_addadmin(event):
+    if await _deny_if_not_admin(event):
+        return
+    arg = (event.pattern_match.group(2) or "").strip()
+    target_id = await _resolve_target_id(event, arg)
+    if target_id is None:
+        await event.respond(
+            "Usage: `/addadmin <user_id>` ya kisi user ke message ko "
+            "**reply** karke bina argument ke `/addadmin` chalayein.\n"
+            "User ID @userinfobot se pata kar sakte hain."
+        )
+        return
+    if target_id in ADMIN_IDS:
+        await event.respond(f"ℹ️ `{target_id}` pehle se admin hai.")
+        return
+    ADMIN_IDS.add(target_id)
+    _save_admin_ids()
+    await event.respond(f"✅ `{target_id}` ko admin bana diya gaya. Total admins: **{len(ADMIN_IDS)}**")
+
+
+@bot.on(events.NewMessage(pattern=r"^/deladmin(@\w+)?(\s+.*)?$"))
+async def on_deladmin(event):
+    if await _deny_if_not_admin(event):
+        return
+    arg = (event.pattern_match.group(2) or "").strip()
+    target_id = await _resolve_target_id(event, arg)
+    if target_id is None:
+        await event.respond(
+            "Usage: `/deladmin <user_id>` ya kisi admin ke message ko "
+            "**reply** karke bina argument ke `/deladmin` chalayein."
+        )
+        return
+    if target_id not in ADMIN_IDS:
+        await event.respond(f"ℹ️ `{target_id}` admin nahi hai.")
+        return
+    if len(ADMIN_IDS) <= 1:
+        await event.respond(
+            "⛔ Last admin ko remove nahi kar sakte — isse koi bhi admin "
+            "command use nahi kar payega. Pehle koi doosra admin add karein."
+        )
+        return
+    ADMIN_IDS.discard(target_id)
+    _save_admin_ids()
+    note = " (aapne khud ko remove kar diya)" if target_id == event.sender_id else ""
+    await event.respond(
+        f"✅ `{target_id}` ko admin list se hata diya gaya{note}. "
+        f"Total admins: **{len(ADMIN_IDS)}**"
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/admins(@\w+)?"))
+async def on_admins(event):
+    if await _deny_if_not_admin(event):
+        return
+    lines = [f"👑 **Admins** ({len(ADMIN_IDS)})"]
+    lines += [f"• `{uid}`" for uid in sorted(ADMIN_IDS)]
+    lines.append(
+        "\n`/addadmin <id>` · `/deladmin <id>` "
+        "(ya kisi user ke message ko reply karke bina id ke)"
+    )
+    await event.respond("\n".join(lines))
 
 
 def note_title(message, text: str) -> str:
@@ -576,8 +864,10 @@ def _closest_terms(token: str, limit: int = 3, min_ratio: float = 0.72):
     return [t for _, t in scored[:limit]]
 
 
-def search(query: str, limit: int = MAX_RESULTS):
+def search(query: str, limit: int = None):
     """FTS5 se candidates -> fuzzy score se rerank -> top results."""
+    if limit is None:
+        limit = MAX_RESULTS  # runtime value (settings se badal sakta hai)
     toks = tokens(query)
     if not toks:
         return []
@@ -882,6 +1172,11 @@ async def on_start(event):
             "\n\n**Admin Commands:**\n"
             "• `/stats` — usage statistics aur active-user trend\n"
             "• `/debug` — configuration status (search kaam na kare tab check karein)\n"
+            "• `/settings` — rate limits, page size waghera bot ke through hi "
+            "change karein (bina .env edit kiye)\n"
+            "• `/setconfig <KEY> <VALUE>` — settings ko ek line me set karein\n"
+            "• `/admins`, `/addadmin <id>`, `/deladmin <id>` — admin list manage "
+            "karein (kisi user ko reply karke bina id ke bhi chalta hai)\n"
             "• `/reindex` — channel ki missing history index karein "
             "(USER_SESSION zaroori hai)\n"
             "• `/broadcast [--g] [--f] [--p]` — kisi message ko reply karke "
@@ -915,6 +1210,15 @@ async def on_dm_plain_text(event):
     ho jaye — groups me ye kaam nahi karta (wahan spam ho jayega),
     isliye sirf private chat tak limited hai. `not e.out` zaroori hai
     warna bot apne hi bheje results ko naye query samajh ke loop kar dega."""
+    # Agar admin ne `/settings` se koi setting edit karne ke liye tap kiya
+    # tha, to ye agla message uska naya value hai — search mat karo.
+    pending_key = _pending_setting_edit.get(event.sender_id)
+    if pending_key and is_admin(event):
+        del _pending_setting_edit[event.sender_id]
+        ok, msg = _apply_setting(pending_key, event.raw_text.strip())
+        await event.respond(msg)
+        return
+
     if not _check_rate_limit(event.sender_id):
         await _rate_limit_notice(event.respond, event.sender_id)
         return
