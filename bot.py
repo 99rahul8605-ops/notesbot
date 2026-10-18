@@ -1155,10 +1155,14 @@ async def on_album(event):
 async def channel_id():
     if not CHANNEL:
         return None
+    # A -100... marked peer ID already identifies the channel; no API
+    # entity/access_hash lookup is needed just to compare event.chat_id.
+    if CHANNEL.lstrip("-").isdigit():
+        return int(CHANNEL)
     if CHANNEL not in _chan_cache:
         try:
             ent = await bot.get_entity(CHANNEL)
-        except ValueError:
+        except (ValueError, TypeError):
             if user:
                 ent = await user.get_entity(CHANNEL)
             else:
@@ -1170,7 +1174,14 @@ async def channel_id():
 _chan_cache = {}
 
 
-@bot.on(events.NewMessage(chats=CHANNEL if CHANNEL else None))
+# Convert numeric -100... IDs to int. Passing strings makes Telethon try to
+# resolve them as phone numbers, which bots cannot do.
+CHANNEL_EVENT_FILTER = (
+    int(CHANNEL) if CHANNEL and CHANNEL.lstrip("-").isdigit()
+    else (CHANNEL or None)
+)
+
+@bot.on(events.NewMessage(chats=CHANNEL_EVENT_FILTER))
 async def on_channel_post(event):
     """Bot channel me admin hai -> har naya post auto-index."""
     if event.is_channel:
