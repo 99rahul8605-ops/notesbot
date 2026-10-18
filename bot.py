@@ -1558,12 +1558,49 @@ def no_session_msg():
     )
 
 
+async def resolve_user_channel():
+    """User session se channel resolve karo, including uncached private IDs.
+
+    StringSession entity/access-hash cache persist nahi karti. Isliye direct
+    numeric get_entity() fail ho sakta hai, even when user channel ka member ho.
+    Dialogs fetch karne se correct InputPeer/access_hash available ho jata hai.
+    """
+    target = CHANNEL.strip()
+    if not target:
+        print("❌ CHANNEL .env mein empty hai.")
+        return None
+
+    lookup = int(target) if target.lstrip("-").isdigit() else target
+    try:
+        return await user.get_entity(lookup)
+    except Exception as exc:
+        print(f"⚠️ Direct channel lookup failed: {type(exc).__name__}: {exc}")
+
+    print("🔄 User account ke Telegram dialogs se channel dhoondh raha hoon...")
+    try:
+        async for dialog in user.iter_dialogs():
+            if isinstance(lookup, int):
+                matched = dialog.id == lookup
+            else:
+                username = getattr(dialog.entity, "username", None)
+                matched = bool(username and username.lower() == target.lstrip("@").lower())
+            if matched:
+                print(f"✅ Channel resolved: {dialog.name} ({dialog.id})")
+                return dialog.entity
+    except Exception as exc:
+        print(f"❌ Dialog scan failed: {type(exc).__name__}: {exc}")
+        return None
+
+    print("❌ Channel user account ke dialogs mein nahi mila. "
+          "Check karo ki SESSION_STRING wala user channel ka member hai.")
+    return None
+
+
 async def backfill():
     """Channel ka history index karo — poora nahi, sirf last indexed
     message ke BAAD wale (incremental), taaki repeat runs fast ho."""
-    try:
-        entity = await user.get_entity(CHANNEL)
-    except Exception:
+    entity = await resolve_user_channel()
+    if entity is None:
         return None, 0
     cid = utils.get_peer_id(entity)  # marked id (-100...), bot events jaise hi
     row = db.execute(
